@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alerta Mascotas Perdidas</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <style>
+    body { font-family: system-ui, sans-serif; background-color: #f7f7f7; margin: 0; padding: 1rem; }
+    h1 { text-align: center; }
+    #app { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1fr 2fr; gap: 1rem; }
+    form { background: white; padding: 1rem; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+    form input, form select, form textarea, form button {
+      width: 100%; margin-top: 8px; padding: 8px;
+      border: 1px solid #ccc; border-radius: 6px; font-size: 14px;
+    }
+    #map { height: 500px; border-radius: 10px; overflow: hidden; }
+    #lista { margin-top: 1rem; }
+    .reporte {
+      background: white; border-radius: 10px; padding: 8px; margin-bottom: 8px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.1); display: flex; gap: 8px; align-items: flex-start;
+      position: relative;
+    }
+    .reporte img {
+      width: 80px; height: 80px; object-fit: cover; border-radius: 8px;
+      flex-shrink: 0;
+    }
+    .contacto { margin-top: 4px; font-size: 13px; color: #333; }
+    .contacto a { color: #0078ff; text-decoration: none; }
+    .actions {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: flex;
+      gap: 6px;
+    }
+    button.action-btn {
+      background: #0078ff;
+      border: none;
+      color: white;
+      padding: 4px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      user-select: none;
+    }
+    button.action-btn.delete {
+      background: #e04b4b;
+    }
+    div.editable {
+      padding: 4px 6px;
+      border-radius: 6px;
+      min-height: 20px;
+      outline: none;
+      cursor: text;
+      border: 1px solid transparent;
+    }
+    div.editable[contenteditable="true"] {
+      border-color: #0078ff;
+      background: #eef6ff;
+    }
+  </style>
+</head>
+<body>
+  <h1>🐾 Alerta Mascotas Perdidas</h1>
+
+  <div id="app">
+    <!-- Formulario -->
+    <form id="form">
+      <h2>Reportar mascota perdida</h2>
+
+      <label>Nombre o título:</label>
+      <input id="titulo" placeholder="Ej: Perro blanco con collar rojo" required />
+
+      <label>Tipo:</label>
+      <select id="tipo">
+        <option>Perro</option>
+        <option>Gato</option>
+        <option>Otro</option>
+      </select>
+
+      <label>Descripción:</label>
+      <textarea id="descripcion" placeholder="Detalles, comportamiento, zona..."></textarea>
+
+      <label>Foto:</label>
+      <input type="file" id="foto" accept="image/*" />
+
+      <hr />
+      <h3>Datos de contacto</h3>
+
+      <label>Tu nombre:</label>
+      <input id="nombre" placeholder="Tu nombre o apodo" required />
+
+      <label>Teléfono:</label>
+      <input id="telefono" type="tel" placeholder="Número de contacto" required />
+
+      <button type="button" id="usarUbicacion">Usar mi ubicación</button>
+      <p id="ubicacionTexto">Ubicación no seleccionada</p>
+
+      <button type="submit">Publicar alerta</button>
+      <button type="button" id="limpiarTodo" style="margin-top:10px; background:#e04b4b;">Eliminar todas las alertas</button>
+    </form>
+
+    <!-- Mapa y lista -->
+    <div>
+      <div id="map"></div>
+      <div id="lista"></div>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'alertasMascotas';
+
+    // Inicializar mapa
+    const map = L.map('map').setView([40.4168, -3.7038], 12); // Madrid por defecto
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    let coordsSeleccionadas = null;
+    let markers = [];
+    let reportes = loadReportes();
+
+    // Función para geocodificación inversa con Nominatim
+    async function reverseGeocode(lat, lng) {
+      const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=es`;
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'AlertaMascotasApp/1.0 (tu-email@ejemplo.com)' }
+      });
+      if (!resp.ok) throw new Error('Error en geocodificación inversa');
+      const data = await resp.json();
+      return data.address || {};
+    }
+
+    // Cargar reportes guardados
+    function loadReportes() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return [];
+        return JSON.parse(raw);
+      } catch {
+        return [];
+      }
+    }
+
+    // Guardar reportes
+    function saveReportes() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(reportes));
+    }
+
+    // Agregar marcador al mapa y guardarlo para borrar después si es necesario
+    function agregarMarcador(coords, reporte) {
+      const lugar = [
+        reporte.address.city || reporte.address.town || reporte.address.village || '',
+        reporte.address.state || '',
+        reporte.address.country || ''
+      ].filter(Boolean).join(', ');
+
+      const marker = L.marker(coords).addTo(map)
+        .bindPopup(`<b>${escapeHtml(reporte.titulo)}</b><br>${escapeHtml(reporte.descripcion)}<br><small>Contacto: <a href='tel:${escapeHtml(reporte.telefono)}'>${escapeHtml(reporte.telefono)}</a></small><br><small>Ubicación: ${escapeHtml(lugar) || 'No disponible'}</small>`);
+      markers.push({ id: reporte.id, marker });
+    }
+
+    // Limpiar todos los marcadores del mapa
+    function limpiarMarcadores() {
+      markers.forEach(({ marker }) => marker.remove());
+      markers = [];
+    }
+
+    // Mostrar lista
+    const lista = document.getElementById('lista');
+    function renderLista() {
+      lista.innerHTML = '';
+      limpiarMarcadores();
+      if(reportes.length === 0) {
+        lista.innerHTML = `<p style="text-align:center; color:#666;">No hay alertas publicadas.</p>`;
+        return;
+      }
+      reportes.forEach(r => {
+        const lugar = [
+          r.address.city || r.address.town || r.address.village || '',
+          r.address.state || '',
+          r.address.country || ''
+        ].filter(Boolean).join(', ');
+
+        const div = document.createElement('div');
+        div.className = 'reporte';
+        div.dataset.id = r.id;
+
+        div.innerHTML = `
+          ${r.foto ? `<img src="${r.foto}" alt="Foto de ${escapeHtml(r.titulo)}">` : `<div style="width:80px;height:80px;background:#eee;border-radius:8px;"></div>`}
+          <div style="flex:1; display:flex; flex-direction:column; gap:4px;">
+            <div class="editable titulo" contenteditable="false" aria-label="Título">${escapeHtml(r.titulo)}</div>
+            <div class="editable tipo" contenteditable="false" aria-label="Tipo">${escapeHtml(r.tipo)}</div>
+            <div class="editable descripcion" contenteditable="false" aria-label="Descripción">${escapeHtml(r.descripcion)}</div>
+            <div class="contacto">
+              <div class="editable nombre" contenteditable="false" aria-label="Nombre del dueño">${escapeHtml(r.nombre)}</div>
+              📞 <a href="tel:${escapeHtml(r.telefono)}" class="telefono-link">${escapeHtml(r.telefono)}</a>
+            </div>
+            <small>Ubicación: ${escapeHtml(lugar) || 'No disponible'}</small>
+          </div>
+          <div class="actions" role="group" aria-label="Acciones">
+            <button class="action-btn edit" aria-label="Editar alerta">Editar</button>
+            <button class="action-btn save" style="display:none;" aria-label="Guardar alerta">Guardar</button>
+            <button class="action-btn delete" aria-label="Eliminar alerta">Eliminar</button>
+          </div>
+        `;
+        lista.prepend(div);
+        agregarMarcador(r.coords, r);
+
+        // Controlar botones y edición
+        const btnEdit = div.querySelector('.edit');
+        const btnSave = div.querySelector('.save');
+        const btnDelete = div.querySelector('.delete');
+
+        const camposEditables = div.querySelectorAll('.editable');
+        const telefonoLink = div.querySelector('.telefono-link');
+
+        // Activar edición
+        btnEdit.addEventListener('click', () => {
+          toggleEdit(true, camposEditables, btnEdit, btnSave, telefonoLink);
+        });
+        // Guardar cambios
+        btnSave.addEventListener('click', () => {
+          toggleEdit(false, camposEditables, btnEdit, btnSave, telefonoLink);
+          guardarCambios(div.dataset.id, camposEditables);
+        });
+
+        // Doble clic en campos para editar
+        camposEditables.forEach(campo => {
+          campo.addEventListener('dblclick', () => {
+            if (btnEdit.style.display !== 'none') {
+              btnEdit.click();
+              campo.focus();
+              placeCaretAtEnd(campo);
+            }
+          });
+
+          // Guardar al salir del campo
+          campo.addEventListener('blur', () => {
+            if (btnEdit.style.display === 'none') { // si está en modo edición
+              btnSave.click();
+            }
+          });
+
+          // Enter guarda (y evita salto de línea)
+          campo.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              campo.blur();
+            }
+          });
+        });
+
+        // Eliminar alerta
+        btnDelete.addEventListener('click', () => {
+          if(confirm('¿Eliminar esta alerta?')) {
+            eliminarReporte(div.dataset.id);
+          }
+        });
+      });
+    }
+
+    function toggleEdit(enable, campos, btnEdit, btnSave, telefonoLink) {
+      campos.forEach(campo => {
+        campo.contentEditable = enable;
+        if(enable) {
+          campo.setAttribute('contenteditable', 'true');
+          campo.classList.add('editable');
+        } else {
+          campo.setAttribute('contenteditable', 'false');
+          campo.classList.remove('editable');
+        }
+      });
+      btnEdit.style.display = enable ? 'none' : 'inline-block';
+      btnSave.style.display = enable ? 'inline-block' : 'none';
+
+      // Para el teléfono, si editable se convierte en input "false" para evitar cambio accidental
+      telefonoLink.style.pointerEvents = enable ? 'none' : 'auto';
+    }
+
+    // Guardar cambios tras edición
+    function guardarCambios(id, campos) {
+      const reporte = reportes.find(r => r.id === id);
+      if(!reporte) return;
+      reporte.titulo = campos[0].innerText.trim();
+      reporte.tipo = campos[1].innerText.trim();
+      reporte.descripcion = campos[2].innerText.trim();
+      reporte.nombre = campos[3].innerText.trim();
+      // El teléfono no se edita desde aquí porque es un link
+      saveReportes();
+      renderLista();
+    }
+
+    // Eliminar reporte
+    function eliminarReporte(id) {
+      reportes = reportes.filter(r => r.id !== id);
+      saveReportes();
+      renderLista();
+    }
+
+    // Poner el caret al final para editar más cómodo
+    function placeCaretAtEnd(el) {
+      el.focus();
+      if(typeof window.getSelection != "undefined"
+        && typeof document.createRange != "undefined") {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    }
+
+    // Escapar texto para evitar inyección XSS
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.replace(/[&<>"']/g, function(m) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+      });
+    }
+
+    // Formulario y ubicación
+    const form = document.getElementById('form');
+    const usarUbicacionBtn = document.getElementById('usarUbicacion');
+    const ubicacionTexto = document.getElementById('ubicacionTexto');
+
+    usarUbicacionBtn.addEventListener('click', () => {
+      if(!navigator.geolocation) {
+        alert('Tu navegador no soporta geolocalización');
+        return;
+      }
+      usarUbicacionBtn.disabled = true;
+      usarUbicacionBtn.textContent = 'Obteniendo ubicación...';
+
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+
+        try {
+          const address = await reverseGeocode(lat, lng);
+          coordsSeleccionadas = [lat, lng];
+          ubicacionTexto.textContent = `Ubicación seleccionada: ${address.city || address.town || address.village || 'Desconocido'}, ${address.state || ''}, ${address.country || ''}`;
+        } catch {
+          ubicacionTexto.textContent = 'No se pudo obtener la ubicación legible';
+        }
+        usarUbicacionBtn.disabled = false;
+        usarUbicacionBtn.textContent = 'Usar mi ubicación';
+      }, (error) => {
+        alert('Error obteniendo la ubicación: ' + error.message);
+        usarUbicacionBtn.disabled = false;
+        usarUbicacionBtn.textContent = 'Usar mi ubicación';
+      });
+    });
+
+    // Subir foto y convertir a base64
+    let fotoDataUrl = '';
+    document.getElementById('foto').addEventListener('change', function(){
+      const file = this.files[0];
+      if(!file) {
+        fotoDataUrl = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = e => {
+        fotoDataUrl = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // Enviar formulario
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+
+      if(!coordsSeleccionadas) {
+        alert('Por favor, usa el botón "Usar mi ubicación" para seleccionar tu ubicación.');
+        return;
+      }
+
+      // Geocodificación inversa para guardar dirección exacta
+      let address = {};
+      try {
+        address = await reverseGeocode(coordsSeleccionadas[0], coordsSeleccionadas[1]);
+      } catch {
+        alert('No se pudo obtener la dirección para la ubicación seleccionada.');
+        return;
+      }
+
+      const nuevoReporte = {
+        id: Date.now().toString(),
+        titulo: form.titulo.value.trim(),
+        tipo: form.tipo.value,
+        descripcion: form.descripcion.value.trim(),
+        foto: fotoDataUrl,
+        nombre: form.nombre.value.trim(),
+        telefono: form.telefono.value.trim(),
+        coords: coordsSeleccionadas,
+        address
+      };
+
+      reportes.push(nuevoReporte);
+      saveReportes();
+      renderLista();
+
+      form.reset();
+      fotoDataUrl = '';
+      coordsSeleccionadas = null;
+      ubicacionTexto.textContent = 'Ubicación no seleccionada';
+    });
+
+    // Eliminar todo
+    document.getElementById('limpiarTodo').addEventListener('click', () => {
+      if(confirm('¿Seguro que quieres eliminar todas las alertas?')) {
+        reportes = [];
+        saveReportes();
+        renderLista();
+      }
+    });
+
+    renderLista();
+
+  </script>
+</body>
+</html>
